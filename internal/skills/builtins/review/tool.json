@@ -1,0 +1,23 @@
+[
+  {
+    "name": "diff_summary",
+    "description": "Parse a unified git diff (either from a raw diff string or by running git diff in a repository) and extract changed files, line counts, modified symbol headers, and regression risk signals.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "diff": {
+          "type": "string",
+          "description": "Optional raw unified diff text to analyze directly. When omitted, runs git diff in work_dir."
+        },
+        "work_dir": {
+          "type": "string",
+          "description": "Repository directory to run git diff in when diff is omitted (defaults to '.')."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional git diff target such as '--staged', 'HEAD', or 'main...HEAD'."
+        }
+      }
+    }
+  }
+]
