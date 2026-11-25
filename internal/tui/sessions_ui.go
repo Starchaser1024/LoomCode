@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Starchaser1024/LoomCode/internal/conversation"
+	"github.com/Starchaser1024/LoomCode/internal/filehistory"
 	"github.com/Starchaser1024/LoomCode/internal/session"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -58,8 +60,15 @@ func (m Model) doResumeSession(wd, targetID string, sessions []session.SessionIn
 	m.committedUpTo = 0
 	m.conversation = conversation.NewManager()
 	m.sessionID = strings.TrimSpace(targetID)
+	m.fileHistory = filehistory.New(wd, m.sessionID)
+	m.defaultTools.EditFile.FileHistory = m.fileHistory
+	m.defaultTools.WriteFile.FileHistory = m.fileHistory
+	if m.defaultTools.FileStateCache != nil {
+		m.defaultTools.FileStateCache.Clear()
+	}
 	if m.ag != nil {
 		m.ag.SetSessionID(m.sessionID)
+		m.ag.FileHistory = m.fileHistory
 	}
 
 	// Compaction-aware rebuild: if the session contains a compact_boundary, rebuild
@@ -281,10 +290,34 @@ var rewindOptions = []string{
 	"Restore code and conversation",
 	"Restore conversation only",
 	"Restore code only",
+	"Force restore code and conversation (overwrite manual edits)",
 	"Never mind",
 }
 
-func (m Model) handleRewind() (tea.Model, tea.Cmd) {
+func formatRewindSummary(checkpointNum int, res *filehistory.RewindResult, includeConv bool) string {
+	var sb strings.Builder
+	totalChanged := len(res.Restored) + len(res.Deleted)
+	if includeConv {
+		sb.WriteString(fmt.Sprintf("⟲ Rewound to checkpoint %d. Updated %d file(s) and conversation.", checkpointNum, totalChanged))
+	} else {
+		sb.WriteString(fmt.Sprintf("⟲ Restored %d file(s) to checkpoint %d. Conversation unchanged.", totalChanged, checkpointNum))
+	}
+	for _, f := range res.Restored {
+		sb.WriteString("\n  • restored: " + f)
+	}
+	for _, f := range res.Deleted {
+		sb.WriteString("\n  • deleted (agent-created): " + f)
+	}
+	if len(res.SkippedUserModified) > 0 {
+		sb.WriteString(fmt.Sprintf("\n  ⚠ preserved %d file(s) modified externally by user (use --force to overwrite):", len(res.SkippedUserModified)))
+		for _, f := range res.SkippedUserModified {
+			sb.WriteString("\n    - " + f)
+		}
+	}
+	return sb.String()
+}
+
+func (m Model) handleRewind(args string) (tea.Model, tea.Cmd) {
 	if m.fileHistory == nil {
 		m.chatMessages = append(m.chatMessages, chatMessage{
 			role: "system", content: "No file history available (fileHistory is nil).",
@@ -300,6 +333,48 @@ func (m Model) handleRewind() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.rewindSnapshots = m.fileHistory.GetSnapshots()
+
+	if strings.TrimSpace(args) != "" {
+		fields := strings.Fields(args)
+		force := false
+		targetIdx := -1
+		for _, tok := range fields {
+			if tok == "--force" || tok == "-f" {
+				force = true
+				continue
+			}
+			if n, err := strconv.Atoi(tok); err == nil {
+				targetIdx = n - 1
+			}
+		}
+		if targetIdx < 0 || targetIdx >= len(m.rewindSnapshots) {
+			m.chatMessages = append(m.chatMessages, chatMessage{
+				role:    "error",
+				content: fmt.Sprintf("Usage: /rewind [1..%d] [--force]", len(m.rewindSnapshots)),
+			})
+			m.updateViewport()
+			return m, nil
+		}
+		res, err := m.fileHistory.RewindSafe(targetIdx, force)
+		if err != nil {
+			m.chatMessages = append(m.chatMessages, chatMessage{
+				role: "error", content: fmt.Sprintf("Rewind failed: %s", err),
+			})
+			m.updateViewport()
+			return m, nil
+		}
+		if m.defaultTools.FileStateCache != nil {
+			m.defaultTools.FileStateCache.Clear()
+		}
+		snap := m.rewindSnapshots[targetIdx]
+		m.conversation.TruncateTo(snap.MessageIndex)
+		summary := formatRewindSummary(targetIdx+1, res, true)
+		m.chatMessages = []chatMessage{{role: "system", content: summary}}
+		m.committedUpTo = 0
+		m.updateViewport()
+		return m, nil
+	}
+
 	m.rewindCursor = len(m.rewindSnapshots) - 1
 	m.rewindPhase = 0
 	m.rewindOptionCursor = 0
@@ -374,8 +449,9 @@ func (m Model) executeRewindOption() (tea.Model, tea.Cmd) {
 	var summary string
 
 	switch m.rewindOptionCursor {
-	case 0:
-		changed, err := m.fileHistory.Rewind(m.rewindCursor)
+	case 0, 3:
+		force := m.rewindOptionCursor == 3
+		res, err := m.fileHistory.RewindSafe(m.rewindCursor, force)
 		if err != nil {
 			m.chatMessages = append(m.chatMessages, chatMessage{role: "error", content: fmt.Sprintf("Rewind failed: %s", err)})
 			m.rewindDialog = false
@@ -383,11 +459,11 @@ func (m Model) executeRewindOption() (tea.Model, tea.Cmd) {
 			m.updateViewport()
 			return m, nil
 		}
-		m.conversation.TruncateTo(snap.MessageIndex)
-		summary = fmt.Sprintf("⟲ Rewound to checkpoint %d. Restored %d file(s) and conversation.", m.rewindCursor+1, len(changed))
-		for _, f := range changed {
-			summary += "\n  • " + f
+		if m.defaultTools.FileStateCache != nil {
+			m.defaultTools.FileStateCache.Clear()
 		}
+		m.conversation.TruncateTo(snap.MessageIndex)
+		summary = formatRewindSummary(m.rewindCursor+1, res, true)
 		m.chatMessages = m.chatMessages[:0]
 		m.committedUpTo = 0
 
@@ -398,7 +474,7 @@ func (m Model) executeRewindOption() (tea.Model, tea.Cmd) {
 		m.committedUpTo = 0
 
 	case 2:
-		changed, err := m.fileHistory.Rewind(m.rewindCursor)
+		res, err := m.fileHistory.RewindSafe(m.rewindCursor, false)
 		if err != nil {
 			m.chatMessages = append(m.chatMessages, chatMessage{role: "error", content: fmt.Sprintf("Rewind failed: %s", err)})
 			m.rewindDialog = false
@@ -406,12 +482,12 @@ func (m Model) executeRewindOption() (tea.Model, tea.Cmd) {
 			m.updateViewport()
 			return m, nil
 		}
-		summary = fmt.Sprintf("⟲ Restored %d file(s) to checkpoint %d. Conversation unchanged.", len(changed), m.rewindCursor+1)
-		for _, f := range changed {
-			summary += "\n  • " + f
+		if m.defaultTools.FileStateCache != nil {
+			m.defaultTools.FileStateCache.Clear()
 		}
+		summary = formatRewindSummary(m.rewindCursor+1, res, false)
 
-	case 3:
+	case 4:
 		m.rewindDialog = false
 		m.rewindPhase = 0
 		m.textarea.Focus()
@@ -425,7 +501,7 @@ func (m Model) executeRewindOption() (tea.Model, tea.Cmd) {
 	m.textarea.Focus()
 	m.updateViewport()
 
-	if m.rewindOptionCursor <= 1 {
+	if m.rewindOptionCursor <= 1 || m.rewindOptionCursor == 3 {
 		return m, tea.Batch(
 			func() tea.Msg { return tea.ClearScreen() },
 			tea.Println(m.renderBanner()+"\n"+lipgloss.NewStyle().Foreground(dimText).Render(summary)),

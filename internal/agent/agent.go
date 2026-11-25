@@ -169,6 +169,20 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Manager) <-chan Agen
 
 		conv.InjectLongTermMemory(a.Instructions, a.MemoryContent)
 
+		if a.FileHistory != nil {
+			msgs := conv.GetMessages()
+			preTurnIdx := len(msgs)
+			userText := ""
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Role == "user" && !strings.HasPrefix(msgs[i].Content, "<system-reminder>") {
+					preTurnIdx = i
+					userText = msgs[i].Content
+					break
+				}
+			}
+			a.FileHistory.BeginTurn(preTurnIdx, userText)
+		}
+
 		var totalInput, totalOutput int
 		consecutiveUnknown := 0
 		maxTokensEscalated := false

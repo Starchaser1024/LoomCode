@@ -1,9 +1,9 @@
-
 package worktree
 
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -61,7 +61,7 @@ func CleanupStaleAgentWorktrees(ctx context.Context, cutoffDate time.Time) int {
 		}
 
 		worktreePath := WorktreePathFor(gitRoot, slug)
-		if currentPath == worktreePath {
+		if currentPath != "" && filepath.Clean(currentPath) == filepath.Clean(worktreePath) {
 			continue
 		}
 
@@ -82,8 +82,12 @@ func CleanupStaleAgentWorktrees(ctx context.Context, cutoffDate time.Time) int {
 			continue
 		}
 
+		// Protect any commits on the worktree branch that are not reachable from a non-worktree
+		// local branch (e.g. main/master) or any remote-tracking ref. Note: --branches strips the
+		// refs/heads/ prefix when matching --exclude patterns.
 		unpushedOut, _, unpushedCode := runGit(ctx, worktreePath,
-			"rev-list", "--max-count=1", "HEAD", "--not", "--remotes")
+			"rev-list", "--max-count=1", "HEAD", "--not",
+			"--exclude=worktree-*", "--exclude=refs/heads/worktree-*", "--branches", "--remotes")
 		if unpushedCode != 0 || strings.TrimSpace(unpushedOut) != "" {
 			continue
 		}
@@ -122,4 +126,3 @@ func StartCleanupLoop(ctx context.Context) {
 		}
 	}()
 }
-

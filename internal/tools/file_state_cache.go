@@ -1,4 +1,3 @@
-
 package tools
 
 import (
@@ -73,6 +72,13 @@ func (c *FileStateCache) Update(filePath string, newContent string) {
 		Content: newContent,
 		Mtime:   info.ModTime().UnixMilli(),
 	}
+}
+
+// Clear resets all cached file read states (e.g. after /rewind or /resume).
+func (c *FileStateCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]*fileStateEntry)
 }
 
 func normalizePath(p string) string {

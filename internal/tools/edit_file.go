@@ -1,4 +1,3 @@
-
 package tools
 
 import (
@@ -15,11 +14,11 @@ type EditFileTool struct {
 	FileStateCache *FileStateCache
 }
 
-func (t *EditFileTool) Name() string            { return "EditFile" }
+func (t *EditFileTool) Name() string { return "EditFile" }
 
-func (t *EditFileTool) Description() string     { return EditFileDescription }
+func (t *EditFileTool) Description() string { return EditFileDescription }
 
-func (t *EditFileTool) Category() ToolCategory  { return CategoryWrite }
+func (t *EditFileTool) Category() ToolCategory { return CategoryWrite }
 
 func (t *EditFileTool) Schema() map[string]any {
 	return map[string]any{
@@ -53,10 +52,6 @@ func (t *EditFileTool) Execute(_ context.Context, args map[string]any) ToolResul
 		}
 	}
 
-	if t.FileHistory != nil {
-		t.FileHistory.TrackEdit(filePath)
-	}
-
 	data, err := os.ReadFile(filePath)
 	if os.IsNotExist(err) {
 		return ToolResult{Output: fmt.Sprintf("Error: file not found: %s", filePath), IsError: true}
@@ -74,9 +69,17 @@ func (t *EditFileTool) Execute(_ context.Context, args map[string]any) ToolResul
 		return ToolResult{Output: fmt.Sprintf("Error: old_string found %d times, must be unique", count), IsError: true}
 	}
 
+	if t.FileHistory != nil {
+		t.FileHistory.TrackEdit(filePath)
+	}
+
 	newContent := strings.Replace(content, oldStr, newStr, 1)
 	if err := os.WriteFile(filePath, []byte(newContent), 0o644); err != nil {
 		return ToolResult{Output: fmt.Sprintf("Error writing file: %s", err), IsError: true}
+	}
+
+	if t.FileHistory != nil {
+		t.FileHistory.RecordWrite(filePath, []byte(newContent))
 	}
 
 	// Update cache after successful edit

@@ -1,4 +1,3 @@
-
 package tools
 
 import (
@@ -15,11 +14,11 @@ type WriteFileTool struct {
 	FileStateCache *FileStateCache
 }
 
-func (t *WriteFileTool) Name() string            { return "WriteFile" }
+func (t *WriteFileTool) Name() string { return "WriteFile" }
 
-func (t *WriteFileTool) Description() string     { return WriteFileDescription }
+func (t *WriteFileTool) Description() string { return WriteFileDescription }
 
-func (t *WriteFileTool) Category() ToolCategory  { return CategoryWrite }
+func (t *WriteFileTool) Category() ToolCategory { return CategoryWrite }
 
 func (t *WriteFileTool) Schema() map[string]any {
 	return map[string]any{
@@ -53,16 +52,20 @@ func (t *WriteFileTool) Execute(_ context.Context, args map[string]any) ToolResu
 		}
 	}
 
-	if t.FileHistory != nil {
-		t.FileHistory.TrackEdit(filePath)
-	}
-
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
 		return ToolResult{Output: fmt.Sprintf("Error creating directories: %s", err), IsError: true}
 	}
 
+	if t.FileHistory != nil {
+		t.FileHistory.TrackEdit(filePath)
+	}
+
 	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
 		return ToolResult{Output: fmt.Sprintf("Error writing file: %s", err), IsError: true}
+	}
+
+	if t.FileHistory != nil {
+		t.FileHistory.RecordWrite(filePath, []byte(content))
 	}
 
 	// Update cache after successful write

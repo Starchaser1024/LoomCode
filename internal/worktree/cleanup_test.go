@@ -1,4 +1,3 @@
-
 package worktree
 
 import (
@@ -47,12 +46,17 @@ func TestCleanupStaleAgentWorktrees(t *testing.T) {
 	repo := t.TempDir()
 	initTestRepo(t, repo)
 
-	// Add a fake remote so --not --remotes works (worktree HEAD is
-	// reachable from the remote, so rev-list returns empty)
+	// Add a fake remote and push HEAD regardless of whether init.defaultBranch is main or master.
 	bare := t.TempDir()
-	exec.Command("git", "init", "--bare", bare).Run()
-	exec.Command("git", "-C", repo, "remote", "add", "origin", bare).Run()
-	exec.Command("git", "-C", repo, "push", "origin", "master").Run()
+	if out, err := exec.Command("git", "init", "--bare", bare).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", repo, "remote", "add", "origin", bare).CombinedOutput(); err != nil {
+		t.Fatalf("git remote add failed: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", repo, "push", "origin", "HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("git push origin HEAD failed: %v\n%s", err, out)
+	}
 
 	origDir, _ := os.Getwd()
 	defer os.Chdir(origDir)
@@ -146,5 +150,70 @@ func TestCleanupStaleAgentWorktrees_SkipsDirtyWorktree(t *testing.T) {
 	removed := CleanupStaleAgentWorktrees(context.Background(), cutoff)
 	if removed != 0 {
 		t.Fatal("dirty worktree should not be cleaned up")
+	}
+}
+
+func TestCleanupStaleAgentWorktrees_LocalRepoWithoutRemote(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+
+	repo := t.TempDir()
+	initTestRepo(t, repo)
+
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	os.Chdir(repo)
+
+	result, err := CreateAgentWorktree(context.Background(), "agent-accccccc")
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	past := time.Now().Add(-36 * time.Hour)
+	os.Chtimes(result.WorktreePath, past, past)
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	removed := CleanupStaleAgentWorktrees(context.Background(), cutoff)
+	if removed != 1 {
+		t.Fatalf("expected 1 removed in local repo without remote, got %d", removed)
+	}
+}
+
+func TestCleanupStaleAgentWorktrees_SkipsUnmergedCommit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+
+	repo := t.TempDir()
+	initTestRepo(t, repo)
+
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	os.Chdir(repo)
+
+	result, err := CreateAgentWorktree(context.Background(), "agent-addddddd")
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	// Commit new work inside the agent worktree that is not on the base branch.
+	if err := os.WriteFile(filepath.Join(result.WorktreePath, "feature.txt"), []byte("work"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", result.WorktreePath, "add", ".").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", result.WorktreePath, "-c", "commit.gpgsign=false", "commit", "-m", "agent commit").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	past := time.Now().Add(-48 * time.Hour)
+	os.Chtimes(result.WorktreePath, past, past)
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	removed := CleanupStaleAgentWorktrees(context.Background(), cutoff)
+	if removed != 0 {
+		t.Fatalf("worktree with unmerged commit should not be cleaned up, got removed=%d", removed)
 	}
 }

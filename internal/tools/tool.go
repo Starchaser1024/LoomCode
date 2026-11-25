@@ -56,13 +56,13 @@ func IsSystemTool(t Tool) bool {
 }
 
 type Registry struct {
-	tools          map[string]Tool
+	tools           map[string]Tool
 	discoveredTools map[string]bool
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
-		tools:          make(map[string]Tool),
+		tools:           make(map[string]Tool),
 		discoveredTools: make(map[string]bool),
 	}
 }
@@ -193,9 +193,10 @@ func (r *Registry) FindDeferredByNames(names []string, protocol string) []map[st
 }
 
 type DefaultTools struct {
-	Registry  *Registry
-	WriteFile *WriteFileTool
-	EditFile  *EditFileTool
+	Registry       *Registry
+	WriteFile      *WriteFileTool
+	EditFile       *EditFileTool
+	FileStateCache *FileStateCache
 }
 
 func CreateDefaultRegistry() *Registry {
@@ -214,5 +215,5 @@ func CreateDefaultTools() DefaultTools {
 	reg.Register(&BashTool{})
 	reg.Register(&GlobTool{})
 	reg.Register(&GrepTool{})
-	return DefaultTools{Registry: reg, WriteFile: wf, EditFile: ef}
+	return DefaultTools{Registry: reg, WriteFile: wf, EditFile: ef, FileStateCache: fsc}
 }

@@ -1,4 +1,3 @@
-
 package worktree
 
 import (
@@ -194,21 +193,28 @@ func initTestRepo(t *testing.T, dir string) {
 		{"git", "init"},
 		{"git", "config", "user.email", "test@test.com"},
 		{"git", "config", "user.name", "Test"},
+		{"git", "config", "commit.gpgsign", "false"},
 	}
 	for _, c := range cmds {
 		cmd := exec.Command(c[0], c[1:]...)
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("%v failed: %s", c, out)
+			t.Fatalf("%v failed: %v\n%s", c, err, out)
 		}
 	}
 	// Create initial commit
 	f := filepath.Join(dir, "init.txt")
-	os.WriteFile(f, []byte("init"), 0o644)
-	cmd := exec.Command("git", "add", ".")
-	cmd.Dir = dir
-	cmd.CombinedOutput()
-	cmd = exec.Command("git", "commit", "-m", "init")
-	cmd.Dir = dir
-	cmd.CombinedOutput()
+	if err := os.WriteFile(f, []byte("init"), 0o644); err != nil {
+		t.Fatalf("write init.txt: %v", err)
+	}
+	for _, c := range [][]string{
+		{"git", "add", "."},
+		{"git", "-c", "commit.gpgsign=false", "commit", "-m", "init"},
+	} {
+		cmd := exec.Command(c[0], c[1:]...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v failed: %v\n%s", c, err, out)
+		}
+	}
 }

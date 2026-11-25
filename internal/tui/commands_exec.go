@@ -9,8 +9,10 @@ import (
 	"github.com/Starchaser1024/LoomCode/internal/commands"
 	"github.com/Starchaser1024/LoomCode/internal/compact"
 	"github.com/Starchaser1024/LoomCode/internal/conversation"
+	"github.com/Starchaser1024/LoomCode/internal/filehistory"
 	"github.com/Starchaser1024/LoomCode/internal/permissions"
 	"github.com/Starchaser1024/LoomCode/internal/planfile"
+	"github.com/Starchaser1024/LoomCode/internal/session"
 	"github.com/Starchaser1024/LoomCode/internal/skills"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -111,12 +113,22 @@ func (m Model) executeCommand(name, args string) (tea.Model, tea.Cmd) {
 	case commands.TypeLocalUI:
 		switch name {
 		case "clear":
+			wd, _ := os.Getwd()
 			m.chatMessages = nil
 			m.committedUpTo = 0
 			m.conversation = conversation.NewManager()
+			m.sessionID = session.NewID()
+			m.fileHistory = filehistory.New(wd, m.sessionID)
+			m.defaultTools.EditFile.FileHistory = m.fileHistory
+			m.defaultTools.WriteFile.FileHistory = m.fileHistory
+			if m.defaultTools.FileStateCache != nil {
+				m.defaultTools.FileStateCache.Clear()
+			}
 			if m.ag != nil {
 				m.ag.ClearActiveSkills()
 				m.ag.SetToolFilter(nil)
+				m.ag.SetSessionID(m.sessionID)
+				m.ag.FileHistory = m.fileHistory
 			}
 			m.updateViewport()
 			return m, tea.Batch(
@@ -174,7 +186,7 @@ func (m Model) executeCommand(name, args string) (tea.Model, tea.Cmd) {
 		case "resume":
 			return m.handleResume(args)
 		case "rewind":
-			return m.handleRewind()
+			return m.handleRewind(args)
 		}
 
 	case commands.TypePrompt:
