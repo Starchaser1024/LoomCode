@@ -71,7 +71,7 @@ flowchart TB
 | 路径 | 职责说明 |
 | :--- | :--- |
 | `cmd/loomcode` | CLI 入口：默认启动交互式 TUI；传入 `--teammate` 时作为无头 Teammate Worker 进程接入共享邮箱循环 |
-| `internal/agent` | 核心流式 ReAct 循环、并发工具执行器（`StreamingExecutor`）、流式错误恢复与单工具执行管线 |
+| `internal/agent` | 核心流式 ReAct 循环、读写栅栏并发执行器（`StreamingExecutor`）、流式错误恢复与结构化执行回执（`ExecutionReceipt`） |
 | `internal/agents` | `Agent` 工具实现：角色化子智能体（`explore` / `plan` / `general-purpose` / `verification`）、会话 Fork 与后台任务管理 |
 | `internal/teams` | 多智能体团队编排：Coordinator 工具收敛、`FileMailBox` 文件锁邮箱、`in-process` / `tmux` / `iTerm2` 后端生命周期 |
 | `internal/worktree` | Git Worktree 隔离管理：零子进程 `.git` 元数据读取、嵌套 Slug 扁平化、会话恢复与陈旧工作树后台清理 |
@@ -86,7 +86,7 @@ flowchart TB
 | `internal/tools` | 基础工具注册表、Read-Before-Edit 文件状态缓存（`FileStateCache`）、`ReadFile` / `EditFile` / `WriteFile` / `Bash` / `Glob` / `Grep` / `ToolSearch` / `AskUserQuestion` |
 | `internal/commands` | 内置斜杠命令注册表与 `~/.loomcode/commands`、`.loomcode/commands` Markdown 自定义命令加载器 |
 | `internal/session` | `.loomcode/sessions/*.jsonl` 会话持久化、相对时间检索与 `compact_boundary` 压缩边界重建 |
-| `internal/filehistory` | 基于内容哈希的逐轮编辑前快照备份与 `/rewind` 代码及对话双向回滚 |
+| `internal/filehistory` | 基于内容哈希的持久化检查点备份、新建文件清理与外部手动修改冲突保护的 `/rewind` 回滚 |
 | `internal/tui` | 模块化 Bubble Tea 终端界面：流式渲染、Markdown 高亮、`@` 文件补全、`/` 命令菜单、权限/计划审批弹窗与团队状态树 |
 
 ---
@@ -179,7 +179,8 @@ loomcode
 | `/test [pkg]` | 激活内置 `test` 技能，自动识别项目栈运行测试并区分业务代码缺陷、测试断言缺陷与环境问题 |
 | `/compact` | 立即触发 Layer 2 上下文摘要压缩，保留近期消息与恢复状态 |
 | `/resume [id]` | 搜索并恢复历史会话（自动识别 `compact_boundary` 重建压缩后状态） |
-| `/rewind` | 浏览当前会话的文件检查点，支持回滚“代码 + 对话”、“仅代码”或“仅对话” |
+| `/rewind [n] [--force]` | 浏览并回滚文件与对话检查点，自动清理后续新建文件并默认保护用户手动编辑 |
+| `/summary [json\|export <path>]` | 查看或导出当前会话的结构化执行摘要（变更文件与行数统计、验证命令、重试/自修复记录及 Token 消耗，别名 `/inspect`） |
 | `/skills` | 列出内置、用户级与项目级已加载的全部 `SKILL.md` 技能 |
 | `/memory [list\|clear]` | 查看或清空自动提炼的长期记忆条目 |
 | `/permission [info\|mode <m>]` | 查看或切换权限模式（`default` / `acceptEdits` / `plan` / `bypassPermissions`） |
