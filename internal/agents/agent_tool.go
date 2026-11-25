@@ -266,12 +266,26 @@ func (t *AgentTool) runSync(ctx context.Context, spec SubAgentSpec, description,
 			}
 		}
 		subAgent.WorkDir = wtResult.WorktreePath
+		if subAgent.Checker != nil {
+			subAgent.Checker = permissions.NewChecker(
+				permissions.NewPathSandbox(wtResult.WorktreePath),
+				subAgent.Checker.RuleEngine,
+				subAgent.Checker.Mode,
+			)
+		}
 
 		parentCwd, _ := os.Getwd()
 		notice := worktree.BuildWorktreeNotice(parentCwd, wtResult.WorktreePath)
 		prompt = notice + "\n\n" + prompt
 	} else if cwdOverride != "" {
 		subAgent.WorkDir = cwdOverride
+		if subAgent.Checker != nil {
+			subAgent.Checker = permissions.NewChecker(
+				permissions.NewPathSandbox(cwdOverride),
+				subAgent.Checker.RuleEngine,
+				subAgent.Checker.Mode,
+			)
+		}
 	}
 
 	conv := conversation.NewManager()

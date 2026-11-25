@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,17 +15,25 @@ import (
 	"github.com/Starchaser1024/LoomCode/internal/hooks"
 	"github.com/Starchaser1024/LoomCode/internal/llm"
 	"github.com/Starchaser1024/LoomCode/internal/permissions"
+	"github.com/Starchaser1024/LoomCode/internal/tools"
 )
+
+const maxTransientStreamRetries = 3
 
 // handleStreamError returns (retry, compacted): retry signals the caller to
 // re-run the turn; compacted signals that a ForceCompact rewrote the
 // conversation, so the caller must drop its usage anchor (its AnchorCount no
 // longer maps to the new transcript).
-func (a *Agent) handleStreamError(ctx context.Context, ch chan AgentEvent, conv *conversation.Manager, err error) (retry, compacted bool) {
+func (a *Agent) handleStreamError(ctx context.Context, ch chan AgentEvent, conv *conversation.Manager, err error, transientRetries *int) (retry, compacted bool) {
+	if ctx.Err() != nil {
+		return false, false
+	}
+
 	var ctxErr *llm.ContextTooLongError
 	if errors.As(err, &ctxErr) {
 		msg, compactErr := compact.ForceCompact(ctx, conv, a.Client, a.WorkDir, a.SessionID, a.ContextWindow, a.RecoveryState, a.currentToolSchemas())
 		if compactErr == nil && msg != "" {
+			a.receipt().recordCompact(msg)
 			ch <- CompactEvent{Message: "Auto-compacted due to context length: " + msg}
 			return true, true
 		}
@@ -33,8 +42,56 @@ func (a *Agent) handleStreamError(ctx context.Context, ch chan AgentEvent, conv 
 
 	var rlErr *llm.RateLimitError
 	if errors.As(err, &rlErr) {
-		wait := parseRetryAfter(rlErr.RetryAfter)
+		if transientRetries != nil && *transientRetries >= maxTransientStreamRetries {
+			return false, false
+		}
+		if transientRetries != nil {
+			*transientRetries++
+		}
+		wait := a.retryWait(rlErr.RetryAfter, transientRetries)
+		reason := fmt.Sprintf("rate limited (429): %s", rlErr.Message)
+		a.receipt().recordRetry(reason)
 		ch <- RetryEvent{Reason: "rate limited", Wait: wait}
+		select {
+		case <-time.After(wait):
+			return true, false
+		case <-ctx.Done():
+			return false, false
+		}
+	}
+
+	var llmErr *llm.LLMError
+	if errors.As(err, &llmErr) && llmErr.IsTransient() {
+		if transientRetries != nil && *transientRetries >= maxTransientStreamRetries {
+			return false, false
+		}
+		if transientRetries != nil {
+			*transientRetries++
+		}
+		wait := a.retryWait("", transientRetries)
+		reason := fmt.Sprintf("transient upstream error: %s", llmErr.Message)
+		a.receipt().recordRetry(reason)
+		ch <- RetryEvent{Reason: reason, Wait: wait}
+		select {
+		case <-time.After(wait):
+			return true, false
+		case <-ctx.Done():
+			return false, false
+		}
+	}
+
+	var netErr *llm.NetworkError
+	if errors.As(err, &netErr) {
+		if transientRetries != nil && *transientRetries >= maxTransientStreamRetries {
+			return false, false
+		}
+		if transientRetries != nil {
+			*transientRetries++
+		}
+		wait := a.retryWait("", transientRetries)
+		reason := fmt.Sprintf("transient network error: %s", netErr.Message)
+		a.receipt().recordRetry(reason)
+		ch <- RetryEvent{Reason: reason, Wait: wait}
 		select {
 		case <-time.After(wait):
 			return true, false
@@ -46,14 +103,24 @@ func (a *Agent) handleStreamError(ctx context.Context, ch chan AgentEvent, conv 
 	return false, false
 }
 
-func parseRetryAfter(header string) time.Duration {
-	if header == "" {
-		return 5 * time.Second
+func (a *Agent) retryWait(retryAfterHeader string, attempt *int) time.Duration {
+	if retryAfterHeader != "" {
+		if secs, err := strconv.Atoi(retryAfterHeader); err == nil {
+			if secs <= 0 {
+				return 5 * time.Millisecond
+			}
+			return time.Duration(secs) * time.Second
+		}
 	}
-	if secs, err := strconv.Atoi(header); err == nil {
-		return time.Duration(secs) * time.Second
+	base := 5 * time.Second
+	if a.RetryBaseDelay > 0 {
+		base = a.RetryBaseDelay
 	}
-	return 5 * time.Second
+	n := 1
+	if attempt != nil && *attempt > 1 {
+		n = 1 << (*attempt - 1)
+	}
+	return base * time.Duration(n)
 }
 
 type toolExecResult struct {
@@ -81,7 +148,7 @@ func (a *Agent) executeSingleTool(ctx context.Context, eventCh chan AgentEvent, 
 	start := time.Now()
 
 	if tool == nil {
-		return toolExecResult{
+		res := toolExecResult{
 			toolID:    tc.ToolID,
 			toolName:  tc.ToolName,
 			output:    fmt.Sprintf("Error: unknown tool '%s'", tc.ToolName),
@@ -89,20 +156,26 @@ func (a *Agent) executeSingleTool(ctx context.Context, eventCh chan AgentEvent, 
 			elapsed:   time.Since(start),
 			isUnknown: true,
 		}
+		a.receipt().recordToolExecution(tc.ToolName, tc.Arguments, res.output, true, res.elapsed)
+		return res
 	}
 
 	if a.Checker != nil {
 		decision := a.Checker.Check(tool, tc.Arguments)
 		if decision.Effect == permissions.Deny {
+			out := fmt.Sprintf("Permission denied: %s", decision.Reason)
+			elapsed := time.Since(start)
+			a.receipt().recordToolExecution(tc.ToolName, tc.Arguments, out, true, elapsed)
 			return toolExecResult{
 				toolID:   tc.ToolID,
 				toolName: tc.ToolName,
-				output:   fmt.Sprintf("Permission denied: %s", decision.Reason),
+				output:   out,
 				isError:  true,
-				elapsed:  time.Since(start),
+				elapsed:  elapsed,
 			}
 		}
 		if decision.Effect == permissions.Ask {
+			a.receipt().recordHumanIntervention()
 			respCh := make(chan PermissionResponse, 1)
 			desc := permissions.ExtractContent(tc.ToolName, tc.Arguments)
 			if desc == "" {
@@ -115,15 +188,18 @@ func (a *Agent) executeSingleTool(ctx context.Context, eventCh chan AgentEvent, 
 			}
 			resp := <-respCh
 			if resp == PermDeny {
+				out := "Permission denied by user"
+				elapsed := time.Since(start)
+				a.receipt().recordToolExecution(tc.ToolName, tc.Arguments, out, true, elapsed)
 				return toolExecResult{
 					toolID:   tc.ToolID,
 					toolName: tc.ToolName,
-					output:   "Permission denied by user",
+					output:   out,
 					isError:  true,
-					elapsed:  time.Since(start),
+					elapsed:  elapsed,
 				}
 			}
-			if resp == PermAllowAlways {
+			if resp == PermAllowAlways && a.Checker.RuleEngine != nil {
 				content := permissions.ExtractContent(tc.ToolName, tc.Arguments)
 				pattern := content + "*"
 				if len(content) > 60 {
@@ -146,17 +222,38 @@ func (a *Agent) executeSingleTool(ctx context.Context, eventCh chan AgentEvent, 
 			FilePath:  extractFilePath(tc.Arguments),
 		}
 		if rejected, msg := a.Hooks.RunPreToolHooks(hctx); rejected {
+			out := "Blocked by hook: " + msg
+			elapsed := time.Since(start)
+			a.receipt().recordToolExecution(tc.ToolName, tc.Arguments, out, true, elapsed)
 			return toolExecResult{
 				toolID:   tc.ToolID,
 				toolName: tc.ToolName,
-				output:   "Blocked by hook: " + msg,
+				output:   out,
 				isError:  true,
-				elapsed:  time.Since(start),
+				elapsed:  elapsed,
 			}
 		}
 	}
 
+	var writeTarget string
+	if tool.Category() == tools.CategoryWrite {
+		if targetPath := extractFilePath(tc.Arguments); targetPath != "" {
+			writeTarget = targetPath
+			if !filepath.IsAbs(writeTarget) && a.WorkDir != "" {
+				if _, err := os.Stat(writeTarget); err != nil {
+					writeTarget = filepath.Join(a.WorkDir, writeTarget)
+				}
+			}
+			a.receipt().capturePreFileTouch(writeTarget)
+		}
+	}
+
 	result := tool.Execute(ctx, tc.Arguments)
+	elapsed := time.Since(start)
+	if !result.IsError && writeTarget != "" {
+		a.receipt().capturePostFileTouch(writeTarget)
+	}
+	a.receipt().recordToolExecution(tc.ToolName, tc.Arguments, result.Output, result.IsError, elapsed)
 
 	// Snapshot what ReadFile just handed to the model so the compact
 	// recovery block can replay it after a Layer 2 summary wipes the

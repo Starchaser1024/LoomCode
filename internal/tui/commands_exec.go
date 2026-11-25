@@ -84,6 +84,39 @@ func (m Model) buildCommandContext(args string) *commands.Context {
 		MCPInfo: func() string {
 			return m.mcpServerInfo
 		},
+		ExecutionSummary: func(subArgs string) string {
+			if m.ag == nil {
+				return "No active agent session."
+			}
+			receipt := m.ag.GetReceipt()
+			trimmed := strings.TrimSpace(subArgs)
+			switch {
+			case strings.EqualFold(trimmed, "json"):
+				raw, err := receipt.ToJSON()
+				if err != nil {
+					return "Failed to serialize receipt: " + err.Error()
+				}
+				return raw
+			case strings.HasPrefix(strings.ToLower(trimmed), "export "):
+				outPath := strings.TrimSpace(trimmed[len("export "):])
+				if outPath == "" {
+					return "Usage: /summary [json | export <path>]"
+				}
+				if m.ag.Checker != nil && m.ag.Checker.Sandbox != nil {
+					if ok, reason := m.ag.Checker.Sandbox.Check(outPath); !ok {
+						return "Cannot export receipt: " + reason
+					}
+				}
+				if err := receipt.ExportJSONFile(outPath); err != nil {
+					return "Failed to export receipt: " + err.Error()
+				}
+				return fmt.Sprintf("Execution receipt exported to %s", outPath)
+			case trimmed == "":
+				return receipt.FormatText()
+			default:
+				return "Usage: /summary [json | export <path>]"
+			}
+		},
 	}
 }
 
@@ -129,6 +162,7 @@ func (m Model) executeCommand(name, args string) (tea.Model, tea.Cmd) {
 				m.ag.SetToolFilter(nil)
 				m.ag.SetSessionID(m.sessionID)
 				m.ag.FileHistory = m.fileHistory
+				m.ag.ResetReceipt()
 			}
 			m.updateViewport()
 			return m, tea.Batch(

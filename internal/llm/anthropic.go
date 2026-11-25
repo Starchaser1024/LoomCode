@@ -1,4 +1,3 @@
-
 package llm
 
 import (
@@ -407,7 +406,10 @@ func classifyAnthropicError(err error) error {
 			}
 			return &RateLimitError{Message: msg, RetryAfter: retry}
 		default:
-			return &LLMError{Message: fmt.Sprintf("API error (%d): %s", apiErr.StatusCode, apiErr.Error())}
+			return &LLMError{
+				StatusCode: apiErr.StatusCode,
+				Message:    fmt.Sprintf("API error (%d): %s", apiErr.StatusCode, apiErr.Error()),
+			}
 		}
 	}
 	return &NetworkError{Message: fmt.Sprintf("Network error: %s", err.Error())}

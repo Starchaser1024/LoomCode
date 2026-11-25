@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -29,10 +30,10 @@ type Decision struct {
 type PermissionMode string
 
 const (
-	ModeDefault      PermissionMode = "default"
-	ModeAcceptEdits  PermissionMode = "acceptEdits"
-	ModePlan         PermissionMode = "plan"
-	ModeBypass       PermissionMode = "bypassPermissions"
+	ModeDefault     PermissionMode = "default"
+	ModeAcceptEdits PermissionMode = "acceptEdits"
+	ModePlan        PermissionMode = "plan"
+	ModeBypass      PermissionMode = "bypassPermissions"
 )
 
 var modeMatrix = map[PermissionMode]map[tools.ToolCategory]DecisionEffect{
@@ -57,7 +58,12 @@ type dangerousPattern struct {
 }
 
 var defaultDangerousPatterns = []dangerousPattern{
-	{regexp.MustCompile(`rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/\s*$`), "recursive force delete root"},
+	{regexp.MustCompile(`\brm\s+(?:-[a-zA-Z]*[rf][a-zA-Z]*\s+|--(?:recursive|force|no-preserve-root)\s+){1,4}/(?:\*|\s*$|\s*[;&|])`), "recursive force delete root"},
+	{regexp.MustCompile(`\brm\s+(?:-[a-zA-Z]+\s+|--(?:recursive|force)\s+)*["']?\.git["']?(?:/|\s*$|\s*[;&|])`), "delete .git repository metadata"},
+	{regexp.MustCompile(`\bgit\s+(?:\S+\s+)*reset\s+(?:\S+\s+)*--hard(?:\s|$|[;&|])`), "destructive git reset --hard"},
+	{regexp.MustCompile(`\bgit\s+(?:\S+\s+)*clean\s+(?:-[a-zA-Z]*f|--force)`), "destructive git clean"},
+	{regexp.MustCompile(`\bgit\s+(?:\S+\s+)*checkout\s+(?:--\s+)?\.(?:\s*$|\s+[;&|]|\s*$)`), "destructive git checkout discarding workspace changes"},
+	{regexp.MustCompile(`\bgit\s+(?:\S+\s+)*restore\s+(?:--worktree\s+)?(?:--\s+)?\.(?:\s*$|\s+[;&|])`), "destructive git restore discarding workspace changes"},
 	{regexp.MustCompile(`mkfs\.`), "format disk"},
 	{regexp.MustCompile(`dd\s+if=.*of=/dev/`), "direct write to disk device"},
 	{regexp.MustCompile(`chmod\s+-R\s+777\s+/`), "recursive chmod root"},
@@ -79,31 +85,198 @@ func DetectDangerous(command string) (bool, string) {
 // Layer 2: Path sandbox
 
 type PathSandbox struct {
-	allowedRoots []string
+	projectRoot  string
+	primaryRoots []string
+	deniedRoots  []string
+	tempRoot     string
 }
 
 func NewPathSandbox(projectRoot string, extraAllowed ...string) *PathSandbox {
-	root, _ := filepath.Abs(projectRoot)
-	allowed := []string{root, os.TempDir()}
+	sb := newSandbox(projectRoot, true, extraAllowed...)
+	return sb
+}
+
+// NewStrictPathSandbox confines file and command working-directory access strictly to
+// workspaceRoot (plus any extraAllowed roots), without granting global os.TempDir() access.
+func NewStrictPathSandbox(workspaceRoot string, extraAllowed ...string) *PathSandbox {
+	return newSandbox(workspaceRoot, false, extraAllowed...)
+}
+
+func newSandbox(projectRoot string, allowTemp bool, extraAllowed ...string) *PathSandbox {
+	root := canonicalizeSandboxPath(projectRoot)
+	primary := []string{root}
 	for _, p := range extraAllowed {
-		abs, _ := filepath.Abs(p)
-		allowed = append(allowed, abs)
+		if p == "" {
+			continue
+		}
+		primary = append(primary, canonicalizeSandboxPath(p))
 	}
-	return &PathSandbox{allowedRoots: allowed}
+
+	var denied []string
+	if parentRepo := detectWorktreeParentRepo(root); parentRepo != "" && !sameCleanPath(parentRepo, root) {
+		denied = append(denied, parentRepo)
+	}
+
+	tempRoot := ""
+	if allowTemp {
+		tempRoot = canonicalizeSandboxPath(os.TempDir())
+	}
+
+	return &PathSandbox{
+		projectRoot:  root,
+		primaryRoots: primary,
+		deniedRoots:  denied,
+		tempRoot:     tempRoot,
+	}
+}
+
+// ProjectRoot returns the canonical active workspace or worktree root.
+func (s *PathSandbox) ProjectRoot() string {
+	if s == nil {
+		return ""
+	}
+	return s.projectRoot
 }
 
 func (s *PathSandbox) Check(path string) (bool, string) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return false, fmt.Sprintf("cannot resolve path: %s", path)
+	if s == nil {
+		return true, ""
+	}
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return false, "empty path"
 	}
 
-	for _, root := range s.allowedRoots {
-		if strings.HasPrefix(abs, root) {
+	candidate := trimmed
+	if !filepath.IsAbs(candidate) && !strings.HasPrefix(candidate, "/") && !strings.HasPrefix(candidate, `\`) && s.projectRoot != "" {
+		candidate = filepath.Join(s.projectRoot, candidate)
+	}
+	resolved := canonicalizeSandboxPath(candidate)
+
+	for _, root := range s.primaryRoots {
+		if root != "" && isWithinDir(resolved, root) {
 			return true, ""
 		}
 	}
+
+	// If running inside an isolated .loomcode/worktrees/<slug> workspace, explicitly reject
+	// escaping into the parent checkout even when both live under os.TempDir() in tests.
+	for _, denied := range s.deniedRoots {
+		if denied != "" && isWithinDir(resolved, denied) {
+			return false, fmt.Sprintf("path %s escapes worktree into parent checkout", path)
+		}
+	}
+
+	if s.tempRoot != "" && isWithinDir(resolved, s.tempRoot) {
+		return true, ""
+	}
+
 	return false, fmt.Sprintf("path %s outside sandbox", path)
+}
+
+var (
+	shellCdPattern  = regexp.MustCompile(`(?:^|[;&|]\s*|\n\s*)cd\s+([^\s;&|]+)`)
+	gitDashCPattern = regexp.MustCompile(`\bgit\s+-C\s+([^\s;&|]+)`)
+)
+
+// CheckCommandDir verifies that explicit command working-directory arguments (args["cwd"],
+// `cd <dir>`, or `git -C <dir>`) do not escape the active workspace/worktree sandbox.
+func (s *PathSandbox) CheckCommandDir(command string, args map[string]any) (bool, string) {
+	if s == nil {
+		return true, ""
+	}
+	if args != nil {
+		if cwd, ok := args["cwd"].(string); ok && strings.TrimSpace(cwd) != "" {
+			if ok, reason := s.Check(cwd); !ok {
+				return false, fmt.Sprintf("command working directory blocked: %s", reason)
+			}
+		}
+	}
+
+	for _, re := range []*regexp.Regexp{shellCdPattern, gitDashCPattern} {
+		matches := re.FindAllStringSubmatch(command, -1)
+		for _, m := range matches {
+			if len(m) < 2 {
+				continue
+			}
+			target := strings.Trim(m[1], `"'`)
+			if target == "" || target == "-" || strings.HasPrefix(target, "$") || strings.HasPrefix(target, "~") {
+				if strings.HasPrefix(target, "~") {
+					return false, fmt.Sprintf("command directory %s escapes workspace sandbox", target)
+				}
+				continue
+			}
+			if ok, reason := s.Check(target); !ok {
+				return false, fmt.Sprintf("command directory %s blocked: %s", target, reason)
+			}
+		}
+	}
+	return true, ""
+}
+
+// canonicalizeSandboxPath resolves symlinks on the deepest existing prefix of p and re-attaches
+// any not-yet-created trailing path segments, preventing symlink escape on new-file creation.
+func canonicalizeSandboxPath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = filepath.Clean(p)
+	}
+	abs = filepath.Clean(abs)
+
+	cur := abs
+	var missingTail []string
+	for {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			for i := len(missingTail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missingTail[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		missingTail = append(missingTail, filepath.Base(cur))
+		cur = parent
+	}
+	return abs
+}
+
+func isWithinDir(target, root string) bool {
+	if runtime.GOOS == "windows" {
+		if !strings.EqualFold(filepath.VolumeName(target), filepath.VolumeName(root)) {
+			return false
+		}
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false
+	}
+	return true
+}
+
+func sameCleanPath(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func detectWorktreeParentRepo(root string) string {
+	slash := filepath.ToSlash(filepath.Clean(root))
+	const marker = "/.loomcode/worktrees/"
+	idx := strings.LastIndex(slash, marker)
+	if idx <= 0 {
+		return ""
+	}
+	return filepath.FromSlash(slash[:idx])
 }
 
 // Layer 3: Rule engine
@@ -273,17 +446,23 @@ func (c *Checker) Check(tool tools.Tool, args map[string]any) Decision {
 		return Decision{Effect: Allow, Reason: "Plan mode: plan file write allowed"}
 	}
 
-	// Layer 1: safe read-only commands (auto-allow)
-	if cat == tools.CategoryCommand && IsSafeCommand(content) {
-		return Decision{Effect: Allow, Reason: "Safe read-only command"}
-	}
-
-	// Layer 2: dangerous command (Bash only)
+	// Layer 1: dangerous command (Bash only) — evaluated before safe-prefix checks so nothing
+	// destructive can ever bypass safety gates.
 	if cat == tools.CategoryCommand {
 		hit, reason := DetectDangerous(content)
 		if hit {
 			return Decision{Effect: Deny, Reason: fmt.Sprintf("Dangerous command blocked: %s", reason)}
 		}
+		if c.Sandbox != nil {
+			if ok, reason := c.Sandbox.CheckCommandDir(content, args); !ok {
+				return Decision{Effect: Deny, Reason: fmt.Sprintf("Path sandbox: %s", reason)}
+			}
+		}
+	}
+
+	// Layer 2: safe read-only commands (auto-allow)
+	if cat == tools.CategoryCommand && IsSafeCommand(content) {
+		return Decision{Effect: Allow, Reason: "Safe read-only command"}
 	}
 
 	// Layer 3: path sandbox (file tools)
@@ -295,12 +474,14 @@ func (c *Checker) Check(tool tools.Tool, args map[string]any) Decision {
 	}
 
 	// Layer 4: rule engine
-	ruleResult := c.RuleEngine.Evaluate(tool.Name(), content)
-	if ruleResult != nil {
-		if *ruleResult == RuleAllow {
-			return Decision{Effect: Allow, Reason: "Permission rule: allow"}
+	if c.RuleEngine != nil {
+		ruleResult := c.RuleEngine.Evaluate(tool.Name(), content)
+		if ruleResult != nil {
+			if *ruleResult == RuleAllow {
+				return Decision{Effect: Allow, Reason: "Permission rule: allow"}
+			}
+			return Decision{Effect: Deny, Reason: "Permission rule: deny"}
 		}
-		return Decision{Effect: Deny, Reason: "Permission rule: deny"}
 	}
 
 	// Layer 4: permission mode

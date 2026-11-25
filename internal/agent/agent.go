@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Starchaser1024/LoomCode/internal/compact"
 	"github.com/Starchaser1024/LoomCode/internal/conversation"
@@ -69,7 +70,13 @@ type Agent struct {
 	// file reads and skill invocations. The struct is concurrency-safe so
 	// the streaming executor can write to it from multiple goroutines.
 	RecoveryState *compact.RecoveryState
-	eventCh       chan AgentEvent
+	// Receipt aggregates structured execution telemetry (touched files with diff stats,
+	// verification commands, retries/self-repairs, human interventions, tokens) for /summary.
+	Receipt *ReceiptTracker
+	// RetryBaseDelay overrides the default backoff base duration for transient 429/5xx retries
+	// when non-zero (used by deterministic integration tests).
+	RetryBaseDelay time.Duration
+	eventCh        chan AgentEvent
 	// activeSkills holds Skill SOPs that have been pinned to the environment context. Each Agent Loop
 	// iteration re-injects all entries as system-reminders, so the model sees them at the most
 	// prominent position regardless of how long the conversation grows. Populated by ActivateSkill
@@ -131,6 +138,26 @@ func New(client llm.Client, registry *tools.Registry, protocol string) *Agent {
 		ContextWindow:    200000,
 		ReplacementState: toolresult.New(),
 		RecoveryState:    compact.NewRecoveryState(),
+		Receipt:          NewReceiptTracker(),
+	}
+}
+
+func (a *Agent) receipt() *ReceiptTracker {
+	if a.Receipt == nil {
+		a.Receipt = NewReceiptTracker()
+	}
+	return a.Receipt
+}
+
+// GetReceipt returns an immutable ExecutionReceipt snapshot for the current session/task.
+func (a *Agent) GetReceipt() ExecutionReceipt {
+	return a.receipt().Snapshot(a.SessionID, a.WorkDir)
+}
+
+// ResetReceipt clears accumulated execution telemetry (e.g. on /clear).
+func (a *Agent) ResetReceipt() {
+	if a.Receipt != nil {
+		a.Receipt.Reset()
 	}
 }
 
@@ -162,6 +189,8 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Manager) <-chan Agen
 	ch := make(chan AgentEvent, 32)
 
 	go func() {
+		runStart := a.receipt().markStart()
+		defer func() { a.receipt().markFinish(runStart) }()
 		defer close(ch)
 		defer a.emitHook(hooks.EventSessionEnd, "", nil)
 
@@ -185,6 +214,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Manager) <-chan Agen
 
 		var totalInput, totalOutput int
 		consecutiveUnknown := 0
+		transientRetries := 0
 		maxTokensEscalated := false
 		outputRecoveries := 0
 		// usageAnchor pins the last real API usage to the conversation length at
@@ -200,6 +230,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Manager) <-chan Agen
 			}
 
 			if ctx.Err() != nil {
+				a.receipt().recordInterrupt(ctx.Err().Error())
 				return
 			}
 
@@ -211,6 +242,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Manager) <-chan Agen
 
 			// Two-layer context management: spill+snip always, autocompact when needed.
 			if msg, err := compact.ManageContext(ctx, conv, a.Client, a.WorkDir, a.SessionID, a.ContextWindow, a.MaxOutputTokens, &a.compactTracking, a.RecoveryState, toolSchemas, usageAnchor); err == nil && msg != "" {
+				a.receipt().recordCompact(msg)
 				ch <- CompactEvent{Message: msg}
 				// A compaction rewrote the conversation, so the prior anchor's
 				// AnchorCount no longer maps to the new transcript. Drop it and
@@ -306,18 +338,67 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Manager) <-chan Agen
 			select {
 			case err := <-errs:
 				if err != nil {
-					if retry, compacted := a.handleStreamError(ctx, ch, conv, err); retry {
+					hadCompletedTools := len(toolCalls) > 0
+					if hadCompletedTools {
+						var partialUses []conversation.ToolUseBlock
+						for _, tc := range toolCalls {
+							partialUses = append(partialUses, conversation.ToolUseBlock{
+								ToolUseID: tc.ToolID,
+								ToolName:  tc.ToolName,
+								Arguments: tc.Arguments,
+							})
+						}
+						conv.AddAssistantFull(text, thinkingBlocks, partialUses)
+						partialResults := executor.CollectResults()
+						var partialBlocks []conversation.ToolResultBlock
+						for _, r := range partialResults {
+							ch <- ToolResultEvent{
+								ToolID:   r.toolID,
+								ToolName: r.toolName,
+								Output:   r.output,
+								IsError:  r.isError,
+								Elapsed:  r.elapsed,
+							}
+							truncated := r.output
+							if len(truncated) > tools.MaxOutputChars {
+								truncated = truncated[:tools.MaxOutputChars] + "\n… (output truncated)"
+							}
+							partialBlocks = append(partialBlocks, conversation.ToolResultBlock{
+								ToolUseID: r.toolID,
+								Content:   truncated,
+								IsError:   r.isError,
+							})
+						}
+						conv.AddToolResultsMessage(partialBlocks)
+					}
+					if ctx.Err() != nil {
+						a.receipt().recordInterrupt(ctx.Err().Error())
+						return
+					}
+					if retry, compacted := a.handleStreamError(ctx, ch, conv, err, &transientRetries); retry {
 						if compacted {
 							usageAnchor = compact.UsageAnchor{}
 						}
+						if !hadCompletedTools {
+							iteration--
+						}
 						continue
 					}
+					a.receipt().recordUnresolvedRetryFailure(err.Error())
 					ch <- ErrorEvent{Message: err.Error()}
 					return
 				}
 			default:
 			}
 
+			if ctx.Err() != nil && stopReason == "" && len(toolCalls) == 0 && text == "" {
+				a.receipt().recordInterrupt(ctx.Err().Error())
+				return
+			}
+
+			transientRetries = 0
+			a.receipt().recordStep()
+			a.receipt().recordUsage(usage)
 			totalInput += usage.InputTokens
 			totalOutput += usage.OutputTokens
 			ch <- UsageEvent{InputTokens: totalInput, OutputTokens: totalOutput}

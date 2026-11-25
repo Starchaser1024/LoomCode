@@ -1,4 +1,3 @@
-
 package tools
 
 import (
@@ -6,18 +5,21 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"time"
 )
 
 const maxTimeout = 600
 
-type BashTool struct{}
+type BashTool struct {
+	WorkDir string
+}
 
-func (t *BashTool) Name() string            { return "Bash" }
+func (t *BashTool) Name() string { return "Bash" }
 
-func (t *BashTool) Description() string     { return BashDescription }
+func (t *BashTool) Description() string { return BashDescription }
 
-func (t *BashTool) Category() ToolCategory  { return CategoryCommand }
+func (t *BashTool) Category() ToolCategory { return CategoryCommand }
 
 func (t *BashTool) Schema() map[string]any {
 	return map[string]any{
@@ -48,7 +50,19 @@ func (t *BashTool) Execute(ctx context.Context, args map[string]any) ToolResult 
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		if bashPath, err := exec.LookPath("bash"); err == nil {
+			cmd = exec.CommandContext(ctx, bashPath, "-c", command)
+		} else {
+			cmd = exec.CommandContext(ctx, "cmd", "/C", command)
+		}
+	} else {
+		cmd = exec.CommandContext(ctx, "bash", "-c", command)
+	}
+	if t.WorkDir != "" {
+		cmd.Dir = t.WorkDir
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -22,18 +22,19 @@ const (
 )
 
 type Context struct {
-	Args            string
-	MemoryList      func() []string
-	MemoryClear     func()
-	TokenCount      func() (input, output int)
+	Args              string
+	MemoryList        func() []string
+	MemoryClear       func()
+	TokenCount        func() (input, output int)
 	PermissionMode    func() string
 	SetPermissionMode func(mode string) error
 	ToolCount         func() int
-	SessionInfo     func() string
-	SkillList       func() []SkillInfo
-	MCPInfo         func() string
-	WorkDir         string
-	Model           string
+	SessionInfo       func() string
+	SkillList         func() []SkillInfo
+	MCPInfo           func() string
+	ExecutionSummary  func(args string) string
+	WorkDir           string
+	Model             string
 }
 
 type SkillInfo struct {
@@ -240,6 +241,19 @@ func CreateDefaultRegistry() *Registry {
 			sb.WriteString(fmt.Sprintf("  Model:     %s\n", ctx.Model))
 			sb.WriteString(fmt.Sprintf("  Directory: %s\n", ctx.WorkDir))
 			return sb.String()
+		},
+	})
+
+	r.Register(&Command{
+		Name:        "summary",
+		Description: "Show structured execution receipt (files, verification commands, recoveries, tokens)",
+		Aliases:     []string{"inspect"},
+		Type:        TypeLocal,
+		Handler: func(ctx *Context) string {
+			if ctx.ExecutionSummary == nil {
+				return "No execution summary available."
+			}
+			return ctx.ExecutionSummary(ctx.Args)
 		},
 	})
 
