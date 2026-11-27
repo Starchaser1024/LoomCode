@@ -40,7 +40,7 @@ func TestBashHelperProcess(t *testing.T) {
 		if err != nil {
 			os.Exit(2)
 		}
-		fmt.Fprintln(os.Stdout, wd)
+		fmt.Fprintf(os.Stdout, "CWD=%s\n", wd)
 		os.Exit(0)
 	case "sleep":
 		time.Sleep(15 * time.Second)
@@ -207,19 +207,34 @@ func TestBashExecutionStdoutStderrExitCodeAndWorkDir(t *testing.T) {
 		t.Errorf("expected stderr + exit code 5, got:\n%s", failRes.Output)
 	}
 
-	// Verify WorkDir is honored by child process.
+	// Verify WorkDir is honored by child process (using os.SameFile so Windows 8.3 short paths match).
 	cwdRes := bash.Execute(context.Background(), map[string]any{
 		"command": helperCommand(t, "print-cwd"),
 	})
 	if cwdRes.IsError {
 		t.Fatalf("print-cwd failed: %s", cwdRes.Output)
 	}
-	wantDir, _ := filepath.EvalSymlinks(subDir)
-	if wantDir == "" {
-		wantDir = filepath.Clean(subDir)
+	var gotDir string
+	for _, line := range strings.Split(cwdRes.Output, "\n") {
+		line = strings.TrimSpace(line)
+		if after, ok := strings.CutPrefix(line, "CWD="); ok {
+			gotDir = after
+			break
+		}
 	}
-	if !strings.Contains(strings.ToLower(filepath.ToSlash(cwdRes.Output)), strings.ToLower(filepath.ToSlash(wantDir))) {
-		t.Errorf("expected child cwd %q in output:\n%s", wantDir, cwdRes.Output)
+	if gotDir == "" {
+		t.Fatalf("missing CWD= line in output:\n%s", cwdRes.Output)
+	}
+	gotInfo, err := os.Stat(gotDir)
+	if err != nil {
+		t.Fatalf("stat child cwd %q: %v", gotDir, err)
+	}
+	wantInfo, err := os.Stat(subDir)
+	if err != nil {
+		t.Fatalf("stat want subDir %q: %v", subDir, err)
+	}
+	if !os.SameFile(gotInfo, wantInfo) {
+		t.Errorf("child cwd %q does not match expected WorkDir %q", gotDir, subDir)
 	}
 }
 

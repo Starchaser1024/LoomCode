@@ -64,6 +64,7 @@ func (t *BashTool) Execute(ctx context.Context, args map[string]any) ToolResult 
 	if t.WorkDir != "" {
 		cmd.Dir = t.WorkDir
 	}
+	configureSubprocessKill(cmd)
 	cmd.WaitDelay = 500 * time.Millisecond
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
