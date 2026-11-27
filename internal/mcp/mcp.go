@@ -4,33 +4,59 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/Starchaser1024/LoomCode/internal/tools"
 )
 
+const (
+	// DefaultConnectTimeout bounds MCP TCP/TLS connection establishment, HTTP response headers,
+	// and JSON-RPC initialize handshakes when ServerConfig.TimeoutSec is unset.
+	DefaultConnectTimeout = 15 * time.Second
+
+	maxStderrCaptureBytes = 4096
+	stdioTerminateGrace   = 500 * time.Millisecond
+)
+
 var nonAlphanumeric = regexp.MustCompile(`[^a-zA-Z0-9_]`)
 
 type ServerConfig struct {
-	Name      string            `yaml:"name"`
-	Command   string            `yaml:"command"`
-	Args      []string          `yaml:"args"`
-	URL       string            `yaml:"url"`
-	Transport string            `yaml:"transport"`
-	Headers   map[string]string `yaml:"headers"`
-	Env       map[string]string `yaml:"env"`
+	Name       string            `yaml:"name"`
+	Command    string            `yaml:"command"`
+	Args       []string          `yaml:"args"`
+	URL        string            `yaml:"url"`
+	Transport  string            `yaml:"transport"`
+	Headers    map[string]string `yaml:"headers"`
+	Env        map[string]string `yaml:"env"`
+	TimeoutSec int               `yaml:"timeout_sec"`
+
+	// connectTimeoutOverride is used by unit tests to exercise sub-second timeouts.
+	connectTimeoutOverride time.Duration
 }
 
 func (c *ServerConfig) IsStdio() bool {
 	return c.Command != ""
+}
+
+func (c *ServerConfig) connectTimeout() time.Duration {
+	if c.connectTimeoutOverride > 0 {
+		return c.connectTimeoutOverride
+	}
+	if c.TimeoutSec > 0 {
+		return time.Duration(c.TimeoutSec) * time.Second
+	}
+	return DefaultConnectTimeout
 }
 
 // transportKind picks the HTTP transport variant. Empty/"http"/"streamable" →
@@ -58,22 +84,90 @@ func (h *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	return h.base.RoundTrip(clone)
 }
 
-func newHTTPClient(headers map[string]string) *http.Client {
-	if len(headers) == 0 {
-		return http.DefaultClient
+// newHTTPClient builds an HTTP client with bounded dial, TLS, and response-header
+// timeouts while leaving Client.Timeout unset (0) so long-lived SSE / Streamable HTTP
+// event streams are not prematurely aborted after handshake completes.
+func newHTTPClient(headers map[string]string, timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = DefaultConnectTimeout
 	}
-	return &http.Client{
-		Transport: &headerRoundTripper{
-			base:    http.DefaultTransport,
+
+	var tr *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+	tr.DialContext = (&net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	tr.TLSHandshakeTimeout = timeout
+	tr.ResponseHeaderTimeout = timeout
+	tr.ExpectContinueTimeout = 1 * time.Second
+	tr.IdleConnTimeout = 90 * time.Second
+
+	var rt http.RoundTripper = tr
+	if len(headers) > 0 {
+		rt = &headerRoundTripper{
+			base:    tr,
 			headers: headers,
-		},
+		}
 	}
+	return &http.Client{Transport: rt}
+}
+
+// boundedBuffer retains the trailing max bytes written to it in a thread-safe ring slice.
+// Attaching it to stdio child stderr prevents OSC/log noise from corrupting the TUI while
+// preserving startup failure diagnostics.
+type boundedBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func newBoundedBuffer(maxBytes int) *boundedBuffer {
+	return &boundedBuffer{max: maxBytes}
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if b == nil || b.max <= 0 || n == 0 {
+		return n, nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if n >= b.max {
+		b.buf = append(b.buf[:0], p[n-b.max:]...)
+		return n, nil
+	}
+	if over := len(b.buf) + n - b.max; over > 0 {
+		copy(b.buf, b.buf[over:])
+		b.buf = b.buf[:len(b.buf)-over]
+	}
+	b.buf = append(b.buf, p...)
+	return n, nil
+}
+
+func (b *boundedBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
 }
 
 type Client struct {
-	config  ServerConfig
-	session *mcp.ClientSession
-	sdkClient *mcp.Client
+	mu         sync.Mutex
+	config     ServerConfig
+	session    *mcp.ClientSession
+	sdkClient  *mcp.Client
+	httpClient *http.Client
+	cmd        *exec.Cmd
+	stderrBuf  *boundedBuffer
+	cancel     context.CancelFunc
 }
 
 func NewClient(config ServerConfig) *Client {
@@ -81,24 +175,45 @@ func NewClient(config ServerConfig) *Client {
 }
 
 func (c *Client) Connect(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	impl := &mcp.Implementation{Name: "loomcode", Version: "0.1.0"}
 	c.sdkClient = mcp.NewClient(impl, nil)
+	timeout := c.config.connectTimeout()
 
-	var transport mcp.Transport
+	var (
+		transport mcp.Transport
+		cmd       *exec.Cmd
+		stderrBuf *boundedBuffer
+	)
+
 	switch {
 	case c.config.IsStdio():
-		cmd := exec.Command(c.config.Command, c.config.Args...)
+		stderrBuf = newBoundedBuffer(maxStderrCaptureBytes)
+		cmd = exec.Command(c.config.Command, c.config.Args...)
 		cmd.Env = os.Environ()
 		for k, v := range c.config.Env {
 			cmd.Env = append(cmd.Env, k+"="+os.ExpandEnv(v))
 		}
-		// Detach stderr from the parent tty. Otherwise child processes (npx/node)
-		// detect stderr as a TTY and emit OSC color queries; the terminal sends
-		// the response to the controlling process's stdin, polluting the TUI input.
-		cmd.Stderr = io.Discard
-		transport = &mcp.CommandTransport{Command: cmd}
+		// Capture stderr into a bounded buffer rather than inheriting the parent TTY
+		// (which leaks child logs/OSC queries into the TUI) or discarding diagnostics.
+		cmd.Stderr = stderrBuf
+		c.mu.Lock()
+		c.cmd = cmd
+		c.stderrBuf = stderrBuf
+		c.mu.Unlock()
+
+		transport = &mcp.CommandTransport{
+			Command:           cmd,
+			TerminateDuration: stdioTerminateGrace,
+		}
 	case c.config.URL != "":
-		httpClient := newHTTPClient(c.config.Headers)
+		httpClient := newHTTPClient(c.config.Headers, timeout)
+		c.mu.Lock()
+		c.httpClient = httpClient
+		c.mu.Unlock()
 		if c.config.transportKind() == "sse" {
 			transport = &mcp.SSEClientTransport{Endpoint: c.config.URL, HTTPClient: httpClient}
 		} else {
@@ -108,16 +223,60 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("MCP server %s: neither command nor url configured", c.config.Name)
 	}
 
-	session, err := c.sdkClient.Connect(ctx, transport, nil)
-	if err != nil {
-		return fmt.Errorf("connect MCP server %s: %w", c.config.Name, err)
+	// Keep connCtx alive after a successful handshake (SSEClientTransport binds its
+	// long-lived stream to the connect context) while enforcing a strict handshake deadline.
+	connCtx, connCancel := context.WithCancel(ctx)
+	var timedOut atomic.Bool
+	var timer *time.Timer
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > timeout {
+		timer = time.AfterFunc(timeout, func() {
+			timedOut.Store(true)
+			connCancel()
+		})
 	}
+
+	session, err := c.sdkClient.Connect(connCtx, transport, nil)
+	if timer != nil {
+		timer.Stop()
+	}
+
+	if err != nil {
+		connCancel()
+		terminateProcess(cmd)
+
+		cause := err
+		if timedOut.Load() && ctx.Err() == nil {
+			cause = fmt.Errorf("handshake timed out after %s: %w", timeout, context.DeadlineExceeded)
+		}
+		if stderrTail := strings.TrimSpace(stderrBuf.String()); stderrTail != "" {
+			return fmt.Errorf("connect MCP server %s: %w (stderr: %s)", c.config.Name, cause, stderrTail)
+		}
+		return fmt.Errorf("connect MCP server %s: %w", c.config.Name, cause)
+	}
+
+	c.mu.Lock()
 	c.session = session
+	c.cancel = connCancel
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *Client) ListTools(ctx context.Context) ([]*mcp.Tool, error) {
-	result, err := c.session.ListTools(ctx, nil)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.config.connectTimeout())
+		defer cancel()
+	}
+	c.mu.Lock()
+	session := c.session
+	c.mu.Unlock()
+	if session == nil {
+		return nil, fmt.Errorf("MCP server %s: session not connected", c.config.Name)
+	}
+	result, err := session.ListTools(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +284,13 @@ func (c *Client) ListTools(ctx context.Context) ([]*mcp.Tool, error) {
 }
 
 func (c *Client) CallTool(ctx context.Context, name string, args map[string]any) (string, bool, error) {
-	result, err := c.session.CallTool(ctx, &mcp.CallToolParams{
+	c.mu.Lock()
+	session := c.session
+	c.mu.Unlock()
+	if session == nil {
+		return "", true, fmt.Errorf("MCP server %s: session not connected", c.config.Name)
+	}
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name:      name,
 		Arguments: args,
 	})
@@ -146,8 +311,32 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 }
 
 func (c *Client) Close() {
-	if c.session != nil {
-		c.session.Close()
+	c.mu.Lock()
+	session := c.session
+	c.session = nil
+	cancel := c.cancel
+	c.cancel = nil
+	httpClient := c.httpClient
+	c.httpClient = nil
+	cmd := c.cmd
+	c.cmd = nil
+	c.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if session != nil {
+		_ = session.Close()
+	}
+	if httpClient != nil {
+		httpClient.CloseIdleConnections()
+	}
+	terminateProcess(cmd)
+}
+
+func terminateProcess(cmd *exec.Cmd) {
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
 	}
 }
 
@@ -237,6 +426,10 @@ func (m *Manager) Shutdown() {
 	m.clients = make(map[string]*Client)
 }
 
+func (m *Manager) Close() {
+	m.Shutdown()
+}
+
 // MCPToolWrapper adapts an MCP tool to the Tool interface
 
 type MCPToolWrapper struct {
@@ -252,9 +445,9 @@ func (w *MCPToolWrapper) Name() string {
 func SanitizeName(name string) string {
 	return nonAlphanumeric.ReplaceAllString(name, "_")
 }
-func (w *MCPToolWrapper) Description() string { return w.toolDef.Description }
+func (w *MCPToolWrapper) Description() string          { return w.toolDef.Description }
 func (w *MCPToolWrapper) Category() tools.ToolCategory { return tools.CategoryCommand }
-func (w *MCPToolWrapper) ShouldDefer() bool             { return true }
+func (w *MCPToolWrapper) ShouldDefer() bool            { return true }
 
 func (w *MCPToolWrapper) Schema() map[string]any {
 	inputSchema := w.toolDef.InputSchema

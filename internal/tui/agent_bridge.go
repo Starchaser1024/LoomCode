@@ -163,13 +163,14 @@ func (m *Model) initMCPServersCmd() tea.Cmd {
 		var serverConfigs []mcp.ServerConfig
 		for _, c := range configs {
 			serverConfigs = append(serverConfigs, mcp.ServerConfig{
-				Name:      c.Name,
-				Command:   c.Command,
-				Args:      c.Args,
-				URL:       c.URL,
-				Transport: c.Transport,
-				Headers:   c.Headers,
-				Env:       c.Env,
+				Name:       c.Name,
+				Command:    c.Command,
+				Args:       c.Args,
+				URL:        c.URL,
+				Transport:  c.Transport,
+				Headers:    c.Headers,
+				Env:        c.Env,
+				TimeoutSec: c.TimeoutSec,
 			})
 		}
 		mgr.LoadConfigs(serverConfigs)

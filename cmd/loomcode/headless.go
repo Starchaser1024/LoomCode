@@ -602,17 +602,18 @@ func runHeadless(
 		serverConfigs := make([]mcp.ServerConfig, 0, len(cfg.MCPServers))
 		for _, c := range cfg.MCPServers {
 			serverConfigs = append(serverConfigs, mcp.ServerConfig{
-				Name:      c.Name,
-				Command:   c.Command,
-				Args:      c.Args,
-				URL:       c.URL,
-				Transport: c.Transport,
-				Headers:   c.Headers,
-				Env:       c.Env,
+				Name:       c.Name,
+				Command:    c.Command,
+				Args:       c.Args,
+				URL:        c.URL,
+				Transport:  c.Transport,
+				Headers:    c.Headers,
+				Env:        c.Env,
+				TimeoutSec: c.TimeoutSec,
 			})
 		}
 		mcpMgr.LoadConfigs(serverConfigs)
-		defer mcpMgr.Shutdown()
+		defer mcpMgr.Close()
 
 		mcpRes := mcpMgr.ConnectAll(ctx)
 		for _, t := range mcpRes.Tools {

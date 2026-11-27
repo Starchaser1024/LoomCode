@@ -135,13 +135,14 @@ func (p *ProviderConfig) ResolveAPIKey() string {
 }
 
 type MCPServerConfig struct {
-	Name      string            `yaml:"name"`
-	Command   string            `yaml:"command"`
-	Args      []string          `yaml:"args"`
-	URL       string            `yaml:"url"`
-	Transport string            `yaml:"transport"`
-	Headers   map[string]string `yaml:"headers"`
-	Env       map[string]string `yaml:"env"`
+	Name       string            `yaml:"name"`
+	Command    string            `yaml:"command"`
+	Args       []string          `yaml:"args"`
+	URL        string            `yaml:"url"`
+	Transport  string            `yaml:"transport"`
+	Headers    map[string]string `yaml:"headers"`
+	Env        map[string]string `yaml:"env"`
+	TimeoutSec int               `yaml:"timeout_sec"`
 }
 
 type AppConfig struct {
