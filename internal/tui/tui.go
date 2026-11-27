@@ -177,6 +177,7 @@ type Model struct {
 	fileHistory  *filehistory.History
 	defaultTools tools.DefaultTools
 	prePlanMode  permissions.PermissionMode
+	initialMode  permissions.PermissionMode
 
 	planApprovalDialog bool
 	planApprovalCursor int
@@ -262,6 +263,11 @@ func New(providers []config.ProviderConfig, mcpConfigs []config.MCPServerConfig,
 	return m
 }
 
+// SetInitialPermissionMode sets the starting permission mode before the session initializes.
+func (m *Model) SetInitialPermissionMode(mode permissions.PermissionMode) {
+	m.initialMode = mode
+}
+
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{textarea.Blink}
 	if len(m.providers) == 1 {
@@ -298,12 +304,16 @@ func (m *Model) initProviderSession(p *config.ProviderConfig) error {
 	if userMem := memory.GetUserAutoMemPath(); userMem != "" {
 		sandboxAllow = append(sandboxAllow, userMem)
 	}
+	initMode := m.initialMode
+	if initMode == "" {
+		initMode = permissions.ModeDefault
+	}
 	ag.Checker = permissions.NewChecker(
 		permissions.NewPathSandbox(wd, sandboxAllow...),
 		&permissions.RuleEngine{
 			LocalPath: filepath.Join(wd, ".loomcode", "permissions.local.yaml"),
 		},
-		permissions.ModeDefault,
+		initMode,
 	)
 	ag.NotificationFn = m.drainTaskNotifications
 	ag.ToolNameFilter = coordinatorToolFilter(m.teamMgr)

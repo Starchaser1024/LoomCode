@@ -70,7 +70,7 @@ flowchart TB
 
 | 路径 | 职责说明 |
 | :--- | :--- |
-| `cmd/loomcode` | CLI 入口：默认启动交互式 TUI；传入 `--teammate` 时作为无头 Teammate Worker 进程接入共享邮箱循环 |
+| `cmd/loomcode` | CLI 入口：默认启动交互式 TUI；支持 `-p`/`--prompt` 非交互无头模式（`text` / `json` 执行回执输出）及 `--teammate` Worker 模式 |
 | `internal/agent` | 核心流式 ReAct 循环、读写栅栏并发执行器（`StreamingExecutor`）、流式错误恢复与结构化执行回执（`ExecutionReceipt`） |
 | `internal/agents` | `Agent` 工具实现：角色化子智能体（`explore` / `plan` / `general-purpose` / `verification`）、会话 Fork 与后台任务管理 |
 | `internal/teams` | 多智能体团队编排：Coordinator 工具收敛、`FileMailBox` 文件锁邮箱、`in-process` / `tmux` / `iTerm2` 后端生命周期 |
@@ -157,11 +157,22 @@ hooks:
       message: "Force push is blocked by project hook policy."
 ```
 
-导出对应的 API Key 后即可在任意代码仓库启动：
+导出对应的 API Key 后即可在任意代码仓库启动交互式终端，或通过 `-p` / `--prompt` 在脚本与 CI 中执行单次非交互任务：
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
+
+# 启动全屏交互式 TUI
 loomcode
+
+# 非交互式执行任务（正文输出到 stdout，结构化 Execution Summary 输出到 stderr）
+loomcode -p "定位并修复失败的单元测试"
+
+# 从管道读取输入并以只读/默认权限审查改动
+git diff | loomcode -p - --permission-mode default
+
+# 输出结构化 JSON（含 session_id、assistant_text、receipt 与 error），便于脚本/CI 解析
+loomcode -p "为配置加载模块补充边界测试" --output-format json --permission-mode acceptEdits --cwd .
 ```
 
 ---

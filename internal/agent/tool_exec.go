@@ -175,12 +175,31 @@ func (a *Agent) executeSingleTool(ctx context.Context, eventCh chan AgentEvent, 
 			}
 		}
 		if decision.Effect == permissions.Ask {
-			a.receipt().recordHumanIntervention()
-			respCh := make(chan PermissionResponse, 1)
 			desc := permissions.ExtractContent(tc.ToolName, tc.Arguments)
 			if desc == "" {
 				desc = formatToolArgs(tc.Arguments)
 			}
+			if a.NonInteractive {
+				modeName := string(a.Checker.Mode)
+				if modeName == "" {
+					modeName = string(permissions.ModeDefault)
+				}
+				out := fmt.Sprintf(
+					"Permission denied in headless mode: %s (%s) requires interactive approval under permission mode %q; re-run with --permission-mode acceptEdits or --permission-mode bypassPermissions, or add an allow rule",
+					tc.ToolName, desc, modeName,
+				)
+				elapsed := time.Since(start)
+				a.receipt().recordToolExecution(tc.ToolName, tc.Arguments, out, true, elapsed)
+				return toolExecResult{
+					toolID:   tc.ToolID,
+					toolName: tc.ToolName,
+					output:   out,
+					isError:  true,
+					elapsed:  elapsed,
+				}
+			}
+			a.receipt().recordHumanIntervention()
+			respCh := make(chan PermissionResponse, 1)
 			eventCh <- PermissionRequestEvent{
 				ToolName:   tc.ToolName,
 				Desc:       desc,

@@ -73,6 +73,10 @@ type Agent struct {
 	// Receipt aggregates structured execution telemetry (touched files with diff stats,
 	// verification commands, retries/self-repairs, human interventions, tokens) for /summary.
 	Receipt *ReceiptTracker
+	// NonInteractive disables interactive TUI approval prompts (PermissionRequestEvent).
+	// When true, any tool decision that requires interactive confirmation (permissions.Ask)
+	// is immediately rejected with a descriptive tool error instead of blocking on a dialog.
+	NonInteractive bool
 	// RetryBaseDelay overrides the default backoff base duration for transient 429/5xx retries
 	// when non-zero (used by deterministic integration tests).
 	RetryBaseDelay time.Duration
