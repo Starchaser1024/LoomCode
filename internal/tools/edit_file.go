@@ -27,9 +27,10 @@ func (t *EditFileTool) Schema() map[string]any {
 		"input_schema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"file_path":  map[string]any{"type": "string", "description": "Path to the file to edit"},
-				"old_string": map[string]any{"type": "string", "description": "The exact string to find and replace (must be unique in file)"},
-				"new_string": map[string]any{"type": "string", "description": "The replacement string"},
+				"file_path":   map[string]any{"type": "string", "description": "Path to the file to edit"},
+				"old_string":  map[string]any{"type": "string", "description": "The exact string to find and replace (must be unique unless replace_all is true)"},
+				"new_string":  map[string]any{"type": "string", "description": "The replacement string"},
+				"replace_all": map[string]any{"type": "boolean", "description": "Replace all occurrences of old_string in the file", "default": false},
 			},
 			"required": []string{"file_path", "old_string", "new_string"},
 		},
@@ -40,9 +41,13 @@ func (t *EditFileTool) Execute(_ context.Context, args map[string]any) ToolResul
 	filePath, _ := args["file_path"].(string)
 	oldStr, _ := args["old_string"].(string)
 	newStr, _ := args["new_string"].(string)
+	replaceAll, _ := args["replace_all"].(bool)
 
 	if filePath == "" {
 		return ToolResult{Output: "Error: file_path is required", IsError: true}
+	}
+	if oldStr == "" {
+		return ToolResult{Output: "Error: old_string must not be empty", IsError: true}
 	}
 
 	// Read-before-edit gate
@@ -65,7 +70,7 @@ func (t *EditFileTool) Execute(_ context.Context, args map[string]any) ToolResul
 	if count == 0 {
 		return ToolResult{Output: "Error: old_string not found in file", IsError: true}
 	}
-	if count > 1 {
+	if !replaceAll && count > 1 {
 		return ToolResult{Output: fmt.Sprintf("Error: old_string found %d times, must be unique", count), IsError: true}
 	}
 
@@ -73,7 +78,12 @@ func (t *EditFileTool) Execute(_ context.Context, args map[string]any) ToolResul
 		t.FileHistory.TrackEdit(filePath)
 	}
 
-	newContent := strings.Replace(content, oldStr, newStr, 1)
+	var newContent string
+	if replaceAll {
+		newContent = strings.ReplaceAll(content, oldStr, newStr)
+	} else {
+		newContent = strings.Replace(content, oldStr, newStr, 1)
+	}
 	if err := os.WriteFile(filePath, []byte(newContent), 0o644); err != nil {
 		return ToolResult{Output: fmt.Sprintf("Error writing file: %s", err), IsError: true}
 	}

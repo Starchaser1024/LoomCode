@@ -33,13 +33,13 @@ Usage notes:
 - This tool can only read files, not directories. Use Glob to list directory contents.
 - Do NOT re-read a file you just edited to verify — EditFile would have errored if the change failed.`
 
-const EditFileDescription = `Replace an exact string in a file. The old_string must appear exactly once in the file.
+const EditFileDescription = `Replace an exact string in a file. The old_string must appear exactly once unless replace_all is true.
 
 Usage notes:
 - You MUST read the file with ReadFile before editing. This tool will fail otherwise.
 - When editing text from ReadFile output, preserve the exact indentation (tabs/spaces) as shown.
 - ALWAYS prefer editing existing files over creating new ones.
-- The edit will FAIL if old_string is not unique in the file. Provide more surrounding context to make it unique.
+- The edit will FAIL if old_string is not unique in the file unless replace_all: true is set. Provide more surrounding context to make it unique, or set replace_all: true when renaming across the file.
 - Use the smallest old_string that is clearly unique — 2-4 adjacent lines is usually sufficient.
 - The new_string must be different from old_string.`
 

@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -63,14 +64,18 @@ func (t *BashTool) Execute(ctx context.Context, args map[string]any) ToolResult 
 	if t.WorkDir != "" {
 		cmd.Dir = t.WorkDir
 	}
+	cmd.WaitDelay = 500 * time.Millisecond
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
 
-	if ctx.Err() == context.DeadlineExceeded {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return ToolResult{Output: fmt.Sprintf("Error: command timed out after %ds", timeout), IsError: true}
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return ToolResult{Output: "Error: command cancelled", IsError: true}
 	}
 
 	exitCode := 0
